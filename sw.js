@@ -1,4 +1,4 @@
-const CACHE = 'pm-v1.0.0';
+const CACHE = 'pm-v1.1.0';
 const FILES = ['./', 'index.html', 'styles.css', 'app.js', 'dict.js', 'manifest.webmanifest',
   'vendor/mqtt.min.js', 'vendor/qrcode.js', 'icons/icon-192.png', 'icons/icon-512.png', 'icons/apple-touch-icon.png'];
 self.addEventListener('install', (e) => {
@@ -17,4 +17,13 @@ self.addEventListener('fetch', (e) => {
       return res;
     }).catch(() => caches.match(req, { ignoreSearch: true }).then((r) => r || caches.match('index.html')))
   );
+});
+
+self.addEventListener('notificationclick', (e) => {
+  e.notification.close();
+  const url = (e.notification.data && e.notification.data.url) || './';
+  e.waitUntil(self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then((cs) => {
+    for (const c of cs) { if ('focus' in c) { c.navigate(url); return c.focus(); } }
+    return self.clients.openWindow(url);
+  }));
 });

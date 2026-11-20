@@ -2,7 +2,7 @@
 (function () {
   'use strict';
   const D = window.PM_DICT;
-  const APP_VER = '1.0.0';
+  const APP_VER = '1.1.0';
   const BROKERS = window.PM_BROKERS || [
     'wss://broker.emqx.io:8084/mqtt',
     'wss://broker.hivemq.com:8884/mqtt',
@@ -145,17 +145,17 @@
   // ---------- sieć (MQTT) ----------
   class Net {
     constructor() { this.c = null; this.handlers = {}; this.connected = false; this.onStatus = null; }
-    connect(bi, timeout = 7000) {
+    connect(bi, timeout = 7000, extra) {
       return new Promise((resolve, reject) => {
         if (!window.mqtt) return reject(new Error('Brak biblioteki sieciowej'));
         let done = false;
-        const c = window.mqtt.connect(BROKERS[bi], {
+        const c = window.mqtt.connect(BROKERS[bi], Object.assign({
           clientId: 'pm_' + rid(10),
           keepalive: 30,
           reconnectPeriod: 2000,
           connectTimeout: timeout,
           clean: true,
-        });
+        }, extra || {}));
         const t = setTimeout(() => { if (!done) { done = true; try { c.end(true); } catch (e) {} reject(new Error('timeout')); } }, timeout + 500);
         c.on('connect', () => {
           this.connected = true;
@@ -182,6 +182,148 @@
       this.c.publish(topic, obj == null ? '' : JSON.stringify(obj), { qos: 0, retain });
     }
     close() { try { this.c && this.c.end(true); } catch (e) {} this.c = null; this.handlers = {}; this.connected = false; }
+  }
+
+
+  // ---------- znajomi i zaproszenia ----------
+  // Każdy gracz ma własną "skrzynkę" na serwerze MQTT (po jego id). Zaproszenie to wiadomość
+  // zapisana w skrzynce znajomego (retained), więc dociera także, gdy otworzy aplikację później.
+  const SOC = 'pmsr26/v1/u/';
+  const INVITE_TTL = 20 * 60e3;
+  const Social = {
+    nets: [], seen: new Set(store.get('seenMsg', [])), presence: {}, pending: null, started: false,
+    friends() { return store.get('friends', []); },
+    saveFriends(f) { store.set('friends', f); },
+    addFriend(id, name, quiet) {
+      if (!id || id === me.id) return false;
+      const f = this.friends();
+      const ex = f.find((x) => x.id === id);
+      if (ex) { if (name && ex.name !== name) { ex.name = String(name).slice(0, 18); this.saveFriends(f); } return false; }
+      f.unshift({ id, name: String(name || 'Gracz').slice(0, 18), at: Date.now() });
+      this.saveFriends(f.slice(0, 60));
+      this.watch(id);
+      if (!quiet) toast('Dodano znajomego: ' + (name || 'Gracz'));
+      return true;
+    },
+    removeFriend(id) { this.saveFriends(this.friends().filter((x) => x.id !== id)); },
+    isOnline(id) {
+      const p = this.presence[id];
+      if (!p) return false;
+      return Object.values(p).some((v) => v && v.on && Date.now() - v.at < 3 * 60e3);
+    },
+    async start() {
+      if (this.started || !window.mqtt) return;
+      this.started = true;
+      for (const bi of [0, 1]) this.connectOne(bi);
+      setInterval(() => this.announce(), 60e3);
+    },
+    async connectOne(bi) {
+      const n = new Net();
+      n.onReconnect = () => this.announce();
+      n.sub(SOC + me.id + '/inv', (m) => this.onMsg(m, 'inv'));
+      n.sub(SOC + me.id + '/fr', (m) => this.onMsg(m, 'fr'));
+      this.friends().forEach((f) => n.sub(SOC + f.id + '/p', (m) => this.onPresence(f.id, bi, m)));
+      n.bi = bi;
+      try {
+        await n.connect(bi, 8000, { will: { topic: SOC + me.id + '/p', payload: JSON.stringify({ on: 0, at: Date.now() }), qos: 0, retain: true } });
+        this.nets.push(n);
+        this.announce();
+      } catch (e) { setTimeout(() => this.connectOne(bi), 30e3); }
+    },
+    watch(id) { this.nets.forEach((n) => n.sub(SOC + id + '/p', (m) => this.onPresence(id, n.bi, m))); },
+    announce() {
+      if (!me.name) return;
+      this.nets.forEach((n) => n.pub(SOC + me.id + '/p', { on: 1, at: Date.now(), name: me.name }, true));
+    },
+    onPresence(id, bi, m) {
+      this.presence[id] = this.presence[id] || {};
+      this.presence[id][bi] = m;
+      if (m && m.name) this.addFriend(id, m.name, true);
+      const el = document.querySelectorAll('[data-dot="' + id + '"]');
+      el.forEach((d) => d.classList.toggle('off', !this.isOnline(id)));
+    },
+    sendTo(id, box, msg) {
+      msg.mid = rid(8); msg.from = me.id; msg.fromName = me.name; msg.at = Date.now();
+      if (!this.nets.length) { toast('Brak połączenia, spróbuj za chwilę'); return false; }
+      this.nets.forEach((n) => n.pub(SOC + id + '/' + box, msg, true));
+      return true;
+    },
+    invite(id, gameCode, b) {
+      const f = this.friends().find((x) => x.id === id);
+      if (this.sendTo(id, 'inv', { t: 'invite', code: gameCode, b })) toast('Zaproszenie wysłane: ' + (f ? f.name : ''));
+    },
+    onMsg(m, box) {
+      if (!m || !m.mid || this.seen.has(m.mid)) return;
+      this.seen.add(m.mid);
+      store.set('seenMsg', [...this.seen].slice(-200));
+      // wyczyść skrzynkę, żeby wiadomość nie wracała
+      this.nets.forEach((n) => n.pub(SOC + me.id + '/' + box, null, true));
+      if (m.from) this.addFriend(m.from, m.fromName, box === 'inv');
+      if (box === 'fr') {
+        toast((m.fromName || 'Ktoś') + ' dodał Cię do znajomych');
+        if (mode === 'home') render(true);
+        return;
+      }
+      if (m.t === 'invite' && Date.now() - (m.at || 0) < INVITE_TTL) {
+        if (mode === 'online' && code === m.code) return;
+        this.pending = m;
+        showInvite(m);
+      }
+    },
+  };
+  function showInvite(m) {
+    vibrate([200, 100, 200, 100, 300]);
+    try {
+      if (document.hidden && 'Notification' in window && Notification.permission === 'granted') {
+        const url = location.origin + location.pathname + '?g=' + m.code + '&b=' + m.b;
+        navigator.serviceWorker.ready.then((r) => r.showNotification('Państwa Miasta: zaproszenie', {
+          body: (m.fromName || 'Ktoś') + ' zaprasza Cię do gry!', tag: 'invite', icon: 'icons/icon-192.png', data: { url },
+          vibrate: [200, 100, 200],
+        }));
+      }
+    } catch (e) {}
+    const old = $('#inviteOv'); if (old) old.remove();
+    const ov = h('div', { id: 'inviteOv', class: 'overlay' },
+      h('div', { class: 'card', style: 'max-width:360px;width:100%' },
+        h('div', { style: 'font-size:48px' }, '🎲'),
+        h('h2', null, (m.fromName || 'Ktoś') + ' zaprasza Cię do gry!'),
+        h('div', { class: 'code', style: 'font-size:30px' }, m.code),
+        h('div', { class: 'col', style: 'margin-top:12px' },
+          h('button', { class: 'primary wide huge', onclick: () => {
+            if (mode === 'online' && G && G.phase !== 'final' && !confirm('Opuścić obecną grę i dołączyć?')) return;
+            ov.remove(); Social.pending = null;
+            if (mode !== 'home') goHome();
+            joinGame(m.code, m.b);
+          } }, 'Dołącz'),
+          h('button', { class: 'wide', onclick: () => { ov.remove(); Social.pending = null; } }, 'Nie teraz'))));
+    document.body.appendChild(ov);
+  }
+  function friendCode(id) { return (id || '').toUpperCase().replace(/(.{5})(?=.)/, '$1-'); }
+  function friendLink() { return location.origin + location.pathname + '?f=' + me.id + '&n=' + encodeURIComponent(me.name || ''); }
+  async function shareFriendLink() {
+    if (needName()) return;
+    const url = friendLink();
+    const text = 'Dodaj mnie do znajomych w Państwa Miasta, będziemy mogli się zapraszać do gry:';
+    if (navigator.share) { try { await navigator.share({ title: 'Państwa Miasta', text, url }); return; } catch (e) { if (e && e.name === 'AbortError') return; } }
+    try { await navigator.clipboard.writeText(text + ' ' + url); toast('Link skopiowany'); } catch (e) { prompt('Skopiuj link:', url); }
+  }
+  function addFriendByCode(raw) {
+    const id = (raw || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+    if (id.length !== 10) return toast('Kod gracza ma 10 znaków, np. ABCDE-12345');
+    if (id === me.id) return toast('To Twój własny kod');
+    Social.addFriend(id, 'Gracz');
+    Social.sendTo(id, 'fr', { t: 'friend' });
+    render(true);
+  }
+  function friendsList(opts) {
+    const f = Social.friends();
+    if (!f.length) return h('div', { class: 'muted small' }, 'Nie masz jeszcze znajomych. Wyślij komuś swój link albo zagrajcie razem: gracze z Twoich gier dodają się tu sami.');
+    const sorted = [...f].sort((a, b) => Social.isOnline(b.id) - Social.isOnline(a.id));
+    return h('div', { class: 'players' }, sorted.map((x) => h('div', { class: 'player' },
+      h('span', null, h('span', { class: 'dot' + (Social.isOnline(x.id) ? '' : ' off'), 'data-dot': x.id }), x.name),
+      h('span', { class: 'row', style: 'flex:0 0 auto;gap:6px' },
+        opts.onInvite ? h('button', { style: 'padding:7px 12px', onclick: () => opts.onInvite(x) }, opts.label || 'Zaproś') : null,
+        opts.removable ? h('button', { class: 'ghost', style: 'padding:4px 10px', onclick: () => { if (confirm('Usunąć ' + x.name + ' ze znajomych?')) { Social.removeFriend(x.id); render(true); } } }, '✕') : null))));
   }
 
   // ---------- stan aplikacji ----------
@@ -282,6 +424,15 @@
         savedHost && Date.now() - savedHost.at < 12 * 3600e3 ? h('button', { class: 'wide', onclick: () => resumeHost(savedHost) }, '↩ Wróć do swojej gry ' + savedHost.code) : null,
         lastJoin && Date.now() - lastJoin.at < 6 * 3600e3 && !linkCode ? h('button', { class: 'wide ghost', onclick: () => joinGame(lastJoin.code, lastJoin.b) }, '↩ Wróć do gry ' + lastJoin.code) : null),
       h('div', { class: 'card col' },
+        h('h2', null, 'Znajomi'),
+        h('div', { class: 'small muted' }, 'Zielona kropka: ma teraz otwartą aplikację. „Zagraj” zakłada grę i od razu wysyła zaproszenie.'),
+        friendsList({ removable: true, label: '🎲 Zagraj', onInvite: (x) => createGame([x.id]) }),
+        h('div', { class: 'row' },
+          h('button', { onclick: shareFriendLink }, '📤 Wyślij mój link'),
+          h('button', { onclick: () => { const v = prompt('Wpisz kod gracza znajomego (np. ABCDE-12345):'); if (v) addFriendByCode(v); } }, '➕ Dodaj po kodzie')),
+        h('div', { class: 'small muted center' }, 'Twój kod gracza: ', h('b', null, friendCode(me.id))),
+        'Notification' in window && Notification.permission !== 'granted' ? h('button', { class: 'ghost wide', onclick: async () => { try { const r = await Notification.requestPermission(); toast(r === 'granted' ? 'Powiadomienia włączone' : 'Powiadomienia wyłączone'); render(true); } catch (e) {} } }, '🔔 Powiadamiaj o zaproszeniach') : null),
+      h('div', { class: 'card col' },
         h('h2', null, 'Gra offline'),
         h('div', { class: 'muted small' }, 'Bez internetu, na jednym telefonie: odpowiedzi wpisuje każdy po kolei albo gracie na kartkach, a aplikacja losuje literę i mierzy czas.'),
         h('button', { class: 'wide huge', onclick: startOffline }, '📴 Graj offline')),
@@ -324,8 +475,9 @@
 
   // ---------- gospodarz ----------
   let hostLoop = null;
-  async function createGame() {
+  async function createGame(inviteIds) {
     if (needName()) return;
+    if (!Array.isArray(inviteIds)) inviteIds = [];
     toast('Tworzę grę…', 8000);
     for (let i = 0; i < BROKERS.length; i++) {
       try {
@@ -341,6 +493,7 @@
         };
         startHost();
         toast('Gra utworzona: ' + code);
+        inviteIds.forEach((id) => Social.invite(id, code, brokerIdx));
         return;
       } catch (e) { net && net.close(); net = null; }
     }
@@ -548,6 +701,7 @@
 
   function onState(s, fromSelf) {
     const prev = G;
+    if (s && s.players && (!prev || prev.players.length !== s.players.length)) s.players.forEach((p) => Social.addFriend(p.id, p.name, true));
     if (!fromSelf) G = s;
     lastStateAt = Date.now();
     const recv = performance.now();
@@ -673,6 +827,10 @@
           h('button', { class: 'primary wide', onclick: doShare }, '📤 Wyślij zaproszenie (link)'),
           h('div', { class: 'small muted', style: 'margin-top:8px' }, 'Inni mogą też wpisać kod na ekranie startowym albo zeskanować kod QR.')) : h('div', { class: 'muted small' }, 'Czekamy, aż gospodarz wylosuje literę.')),
       h('div', { class: 'card' }, h('h2', null, 'Gracze (' + G.players.length + ')'), playersList(G.round > 0, isHost)),
+      h('details', { class: 'card', open: Social.friends().length > 0 && G.players.length < 2 }, h('summary', null, '📨 Zaproś znajomych'),
+        h('div', { class: 'small muted', style: 'margin:4px 0 8px' }, 'Zaproszenie pojawi się u znajomego, gdy ma otwartą aplikację albo otworzy ją w ciągu 20 minut. Gdy nie odpowiada, wyślij link.'),
+        friendsList({ label: 'Zaproś', onInvite: (x) => Social.invite(x.id, code, brokerIdx) }),
+        h('button', { class: 'wide', style: 'margin-top:8px', onclick: doShare }, '📤 Wyślij link (WhatsApp, SMS…)')),
       settingsEditor(G.settings, () => publish(), isHost),
       isHost ? h('div', { class: 'card center' },
         h('h2', null, G.round ? 'Runda ' + (G.round + 1) : 'Pierwsza runda'),
@@ -953,7 +1111,20 @@
   }
 
   // ---------- start ----------
+  (function handleFriendLink() {
+    const q = new URLSearchParams(location.search);
+    const fid = q.get('f');
+    if (!fid) return;
+    history.replaceState(null, '', location.pathname);
+    if (fid === me.id) return;
+    Social.addFriend(fid, q.get('n') || 'Gracz');
+    Social.pendingFriendHello = fid;
+  })();
   render(true);
+  Social.start().then(() => {});
+  setInterval(() => {
+    if (Social.pendingFriendHello && Social.nets.length && me.name) { Social.sendTo(Social.pendingFriendHello, 'fr', { t: 'friend' }); Social.pendingFriendHello = null; }
+  }, 1500);
   if ('serviceWorker' in navigator && location.protocol !== 'file:') {
     navigator.serviceWorker.register('sw.js').catch(() => {});
   }
